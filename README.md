@@ -126,14 +126,14 @@ Alcapa-trading-dashboard/          ← This repo
 ├── .streamlit/
 │   ├── config.toml              # Dark theme, layout
 │   └── secrets.toml             # API keys + Supabase config (gitignored)
-├── supabase_setup_trader.sql     # Run this once in Supabase SQL Editor
 ├── scheduler/
 │   └── SCHEDULER.md             # cron/systemd guide for keeping trader alive
 └── README.md
 
 alpaca-paper-trader/              ← Separate repo (trading bot)
-├── main.py                       # Runs strategies
+├── main.py                       # Runs strategies + calls SupabaseSync
 ├── sync_supabase.py              # Syncs data to Supabase after each run
+├── supabase_setup_trader.sql     # Run once in Supabase SQL Editor (sets up tables + RLS)
 ├── config/strategy.yaml          # Strategy parameters
 ├── logs/trades.jsonl            # Trade audit log
 └── data/status.json             # Last run status
@@ -179,7 +179,12 @@ https://app.supabase.com/project/YOUR_PROJECT/_/sql
 Paste and run the contents of:
 
 ```
-supabase_setup_trader.sql   ← in this repo
+alpaca-paper-trader/supabase_setup_trader.sql
+```
+
+or download directly from:
+```
+https://raw.githubusercontent.com/tckun79-pixel/alpaca-paper-trader/master/supabase_setup_trader.sql
 ```
 
 This creates three tables with RLS policies:

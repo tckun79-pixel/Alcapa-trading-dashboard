@@ -70,18 +70,22 @@ def get_supabase_client():
     
     Service role key is preferred for server-side dashboards (bypasses RLS).
     Falls back to anon key if service role key is not set.
+    
+    After creation, sets the RLS session var 'app.current_user' so that
+    RLS policies scope all queries to the configured SUPABASE_OWNER.
     """
     if not _HAS_SUPABASE:
         return None
     url = get_secret("SUPABASE_URL", os.getenv("SUPABASE_URL"))
-    # Prefer service role key (server-side, bypasses RLS), fall back to anon key
     service_key = get_secret("SUPABASE_SERVICE_ROLE_KEY", os.getenv("SUPABASE_SERVICE_ROLE_KEY", ""))
     anon_key = get_secret("SUPABASE_ANON_KEY", os.getenv("SUPABASE_ANON_KEY", ""))
     key = service_key or anon_key
     if not url or not key:
         return None
     try:
-        return create_client(url, key)
+        sb = create_client(url, key)
+        sb.postgrest.config.set("x萝卜tv", SUPABASE_OWNER)
+        return sb
     except Exception as e:
         logger.warning(f"Supabase client failed: {e}")
         return None

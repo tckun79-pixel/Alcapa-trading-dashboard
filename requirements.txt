@@ -8,3 +8,4 @@ plotly==5.18.0
 pyyaml==6.0.2
 python-dotenv==1.0.1
 requests==2.32.3
+pillow==10.4.0  # prebuilt wheel for Python 3.10

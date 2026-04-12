@@ -24,12 +24,7 @@ from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
-# Supabase (optional)
-try:
-    from supabase import create_client
-    _HAS_SUPABASE = True
-except ImportError:
-    _HAS_SUPABASE = False
+import requests
 
 # ─── Page Configuration ───────────────────────────────────────────────────────
 st.set_page_config(
@@ -63,31 +58,32 @@ STATUS_FILE = os.getenv("STATUS_FILE", "data/status.json")
 AUTO_REFRESH_INTERVAL = int(get_secret("AUTO_REFRESH_INTERVAL", "60"))
 SUPABASE_OWNER = get_secret("SUPABASE_OWNER", os.getenv("SUPABASE_OWNER", "admin"))
 
-# ─── Supabase Client ───────────────────────────────────────────────────────────
-@st.cache_resource(ttl=60)
-def get_supabase_client():
-    """Return Supabase client if configured, else None.
-    
-    Service role key is preferred for server-side dashboards (bypasses RLS).
-    Falls back to anon key if service role key is not set.
-    
-    After creation, sets the RLS session var 'app.current_user' so that
-    RLS policies scope all queries to the configured SUPABASE_OWNER.
-    """
-    if not _HAS_SUPABASE:
+# ─── Supabase Direct Access ─────────────────────────────────────────────────
+SUPABASE_URL = get_secret("SUPABASE_URL", os.getenv("SUPABASE_URL"))
+SUPABASE_SERVICE_ROLE_KEY = get_secret("SUPABASE_SERVICE_ROLE_KEY", os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_ANON_KEY"))
+
+def _supabase_headers():
+    """Return headers for Supabase REST API using service role key."""
+    if not SUPABASE_SERVICE_ROLE_KEY:
+        return {}
+    return {
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    }
+
+
+def query_supabase(table: str, params: dict = None) -> Optional[list]:
+    """Generic GET from Supabase REST API. Returns list of records or None."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
         return None
-    url = get_secret("SUPABASE_URL", os.getenv("SUPABASE_URL"))
-    service_key = get_secret("SUPABASE_SERVICE_ROLE_KEY", os.getenv("SUPABASE_SERVICE_ROLE_KEY", ""))
-    anon_key = get_secret("SUPABASE_ANON_KEY", os.getenv("SUPABASE_ANON_KEY", ""))
-    key = service_key or anon_key
-    if not url or not key:
-        return None
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
     try:
-        sb = create_client(url, key)
-        sb.postgrest.config.set("x萝卜tv", SUPABASE_OWNER)
-        return sb
+        resp = requests.get(url, headers=_supabase_headers(), params=params, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
     except Exception as e:
-        logger.warning(f"Supabase client failed: {e}")
+        logger.warning(f"Supabase query error for table '{table}': {e}")
         return None
 
 # ─── Client Factory ─────────────────────────────────────────────────────────────
@@ -252,27 +248,13 @@ def fetch_orders(client: TradingClient, status="all", limit=50) -> pd.DataFrame:
 
 def load_trades_log(path: str, limit: int = 200) -> pd.DataFrame:
     """Load trades from Supabase (primary) with local file fallback."""
-    sb = get_supabase_client()
-    if sb:
-        try:
-            resp = (
-                sb.table('trader_trades')
-                .select('*')
-                .eq('owner', SUPABASE_OWNER)
-                .order('created_at', desc=True)
-                .limit(limit)
-                .execute()
-            )
-            rows = resp.data
-            if not rows:
-                return pd.DataFrame()
-            df = pd.DataFrame(rows)
-            if 'timestamp' in df.columns:
-                df['timestamp'] = pd.to_datetime(df['timestamp']).dt.tz_convert('Asia/Singapore')
-            return df
-        except Exception as e:
-            logger.warning(f'Supabase trades query failed: {e}')
-    # Fallback to local file
+    rows = query_supabase('trader_trades', params={'order': 'created_at.desc', 'limit': str(limit)})
+    if rows:
+        df = pd.DataFrame(rows)
+        if 'timestamp' in df.columns:
+            df['timestamp'] = pd.to_datetime(df['timestamp']).dt.tz_convert('Asia/Singapore')
+        return df
+    # Fallback local
     if not os.path.exists(path):
         return pd.DataFrame()
     try:
@@ -298,29 +280,16 @@ def load_trades_log(path: str, limit: int = 200) -> pd.DataFrame:
 
 def load_status_json(path: str) -> Dict:
     """Load status from Supabase (most recent row) with local file fallback."""
-    sb = get_supabase_client()
-    if sb:
-        try:
-            resp = (
-                sb.table('trader_status')
-                .select('*')
-                .eq('owner', SUPABASE_OWNER)
-                .order('created_at', desc=True)
-                .limit(1)
-                .execute()
-            )
-            rows = resp.data
-            if rows:
-                row = rows[0]
-                return {
-                    'last_run': row.get('last_run'),
-                    'status': row.get('status'),
-                    'duration_sec': row.get('duration_sec'),
-                    'extra': row.get('extra') or {},
-                }
-        except Exception as e:
-            logger.warning(f'Supabase status query failed: {e}')
-    # Fallback to local file
+    rows = query_supabase('trader_status', params={'order': 'created_at.desc', 'limit': '1'})
+    if rows:
+        row = rows[0]
+        return {
+            'last_run': row.get('last_run'),
+            'status': row.get('status'),
+            'duration_sec': row.get('duration_sec'),
+            'extra': row.get('extra') or {},
+        }
+    # Fallback
     if not os.path.exists(path):
         return {}
     try:
@@ -332,23 +301,11 @@ def load_status_json(path: str) -> Dict:
 
 def load_strategy_config(path: str) -> Dict:
     """Load strategy config from Supabase (latest) with local file fallback."""
-    sb = get_supabase_client()
-    if sb:
-        try:
-            resp = (
-                sb.table('trader_config')
-                .select('config_json, updated_at')
-                .eq('owner', SUPABASE_OWNER)
-                .order('updated_at', desc=True)
-                .limit(1)
-                .execute()
-            )
-            rows = resp.data
-            if rows:
-                return rows[0].get('config_json', {})
-        except Exception as e:
-            logger.warning(f'Supabase config query failed: {e}')
-    # Fallback to local file
+    rows = query_supabase('trader_config', params={'order': 'updated_at.desc', 'limit': '1'})
+    if rows:
+        row = rows[0]
+        return row.get('config_json', {})
+    # Fallback
     if not os.path.exists(path):
         return {}
     try:

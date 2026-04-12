@@ -1,5 +1,9 @@
 # Alcapa Trading Dashboard
 
+> **Streamlit Cloud dashboard for the Alpaca paper trading system**
+> 
+> Companion repo: [alpaca-paper-trader](https://github.com/tckun79-pixel/alpaca-paper-trader)
+
 A **Streamlit Cloud-ready** dashboard for monitoring the Alpaca paper trading system. View account status, positions, performance metrics, strategy controls, and trade history from any browser or mobile device.
 
 ---
@@ -115,18 +119,54 @@ Your app will be live at `https://[username]-alcapa-trading-dashboard.streamlit.
 
 ## Project Structure
 
+Two separate repositories work together:
+
+1. **[alpaca-paper-trader](https://github.com/tckun79-pixel/alpaca-paper-trader)** — The actual trading bot (runs locally/on a backend server)
+2. **[Alcapa-trading-dashboard](https://github.com/tckun79-pixel/Alcapa-trading-dashboard)** (this repo) — Streamlit Cloud dashboard for viewing status
+
+Data flows: Trader → Supabase → Dashboard (cloud)
+
+---
+
+## Architecture
+
 ```
-Alcapa-trading-dashboard/
-├── app.py                          # Main Streamlit application
-├── requirements.txt                # Python dependencies
-├── README.md                      # This file
-├── .streamlit/
-│   ├── config.toml                # Theme and layout settings
-│   └── secrets.toml               # Secrets template (gitignored)
-├── scheduler/
-│   └── SCHEDULER.md               # Lightweight cron/systemd scheduler guide
-└── .gitignore                     # Git ignore rules
+alpaca-paper-trader (local/backend)
+   ├── main.py runs strategies
+   ├── sync_supabase.py writes to:
+   │      ├── trader_trades
+   │      ├── trader_status
+   │      └── trader_config
+   └── Supabase (cloud DB)
+        ↕ HTTP REST
+Alcapa-trading-dashboard (Streamlit Cloud)
+   └── app.py reads Supabase tables
 ```
+
+---
+
+## Supabase Setup (Required for Dashboard Data)
+
+The dashboard reads live trader data from Supabase. You must:
+
+1. **Create a Supabase project** at https://supabase.com (free tier works)
+2. **Run the SQL schema** in the trader repo:
+   - File: [alpaca-paper-trader/supabase_setup_trader.sql](https://github.com/tckun79-pixel/alpaca-paper-trader/blob/master/supabase_setup_trader.sql)
+   - Open Supabase Dashboard → SQL Editor → paste & run
+3. **Add Supabase secrets** to Streamlit Cloud deployment:
+   - `SUPABASE_URL` — your project URL (e.g., `https://abc.supabase.co`)
+   - `SUPABASE_SERVICE_ROLE_KEY` — from Supabase Settings → API → service_role key
+   > Note: service_role key bypasses RLS; acceptable for single-user dashboard.
+4. **Configure the trader** to sync:
+   - Add to trader `.env`: `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY`
+   - Install `supabase-py` (`pip install supabase-py`)
+   - The trader auto-syncs after each run
+
+Once both sides are configured, the dashboard displays live trades, strategy status, and trader health.
+
+### Local Development with Supabase
+
+Copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml` and fill in your Supabase keys. The dashboard falls back to local files if Supabase credentials are missing.
 
 ---
 

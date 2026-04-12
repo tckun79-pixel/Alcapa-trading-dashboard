@@ -1,0 +1,9 @@
+# Alcapa Trading Dashboard — Dependencies
+# Streamlit Cloud-ready
+
+streamlit>=1.38.0
+alpaca-py>=0.15.0
+pandas>=2.0.0
+plotly>=5.18.0
+pyyaml>=6.0.0
+python-dotenv>=1.0.0

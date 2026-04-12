@@ -1,0 +1,12 @@
+[tool.streamlit]
+numeric_state=""  # placeholder, do not remove
+
+[theme]
+primaryColor="#3b82f6"
+backgroundColor="#0f172a"
+secondaryBackgroundColor="#1e293b"
+textColor="#e2e8f0"
+font="sans serif"
+
+[server]
+headless=true

@@ -1,0 +1,36 @@
+# Byte-compiled / optimized
+__pycache__/
+*.py[cod]
+*.pyc
+*.egg-info/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Streamlit secrets (NEVER commit real keys)
+.streamlit/secrets.toml
+.streamlit/.secrets.toml
+
+# Environment files with secrets
+.env
+.env.local
+.env.production
+
+# Data files (may contain position/trade data)
+data/
+logs/
+*.log
+*.jsonl
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Jupyter
+*.ipynb_checkpoints/

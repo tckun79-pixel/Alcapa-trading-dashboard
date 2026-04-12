@@ -119,12 +119,25 @@ Your app will be live at `https://[username]-alcapa-trading-dashboard.streamlit.
 
 ## Project Structure
 
-Two separate repositories work together:
+```
+Alcapa-trading-dashboard/          ← This repo
+├── app.py                        # Streamlit Cloud dashboard
+├── requirements.txt              # Python dependencies
+├── .streamlit/
+│   ├── config.toml              # Dark theme, layout
+│   └── secrets.toml             # API keys + Supabase config (gitignored)
+├── supabase_setup_trader.sql     # Run this once in Supabase SQL Editor
+├── scheduler/
+│   └── SCHEDULER.md             # cron/systemd guide for keeping trader alive
+└── README.md
 
-1. **[alpaca-paper-trader](https://github.com/tckun79-pixel/alpaca-paper-trader)** — The actual trading bot (runs locally/on a backend server)
-2. **[Alcapa-trading-dashboard](https://github.com/tckun79-pixel/Alcapa-trading-dashboard)** (this repo) — Streamlit Cloud dashboard for viewing status
-
-Data flows: Trader → Supabase → Dashboard (cloud)
+alpaca-paper-trader/              ← Separate repo (trading bot)
+├── main.py                       # Runs strategies
+├── sync_supabase.py              # Syncs data to Supabase after each run
+├── config/strategy.yaml          # Strategy parameters
+├── logs/trades.jsonl            # Trade audit log
+└── data/status.json             # Last run status
+```
 
 ---
 
@@ -147,26 +160,96 @@ Alcapa-trading-dashboard (Streamlit Cloud)
 
 ## Supabase Setup (Required for Dashboard Data)
 
-The dashboard reads live trader data from Supabase. You must:
+The dashboard reads live trader data from Supabase. This enables the Streamlit Cloud dashboard to show trader data even when the trader runs on a separate backend (e.g., home server, VPS, WSL2).
 
-1. **Create a Supabase project** at https://supabase.com (free tier works)
-2. **Run the SQL schema** in the trader repo:
-   - File: [alpaca-paper-trader/supabase_setup_trader.sql](https://github.com/tckun79-pixel/alpaca-paper-trader/blob/master/supabase_setup_trader.sql)
-   - Open Supabase Dashboard → SQL Editor → paste & run
-3. **Add Supabase secrets** to Streamlit Cloud deployment:
-   - `SUPABASE_URL` — your project URL (e.g., `https://abc.supabase.co`)
-   - `SUPABASE_SERVICE_ROLE_KEY` — from Supabase Settings → API → service_role key
-   > Note: service_role key bypasses RLS; acceptable for single-user dashboard.
-4. **Configure the trader** to sync:
-   - Add to trader `.env`: `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY`
-   - Install `supabase-py` (`pip install supabase-py`)
-   - The trader auto-syncs after each run
+### Step 1 — Create a Supabase Project
 
-Once both sides are configured, the dashboard displays live trades, strategy status, and trader health.
+1. Sign up at https://supabase.com (free tier is sufficient)
+2. Note your **Project URL** from Settings → API (e.g. `https://xyz.supabase.co`)
+3. Copy the **service_role secret** from Settings → API → `service_role secret`
 
-### Local Development with Supabase
+### Step 2 — Run the SQL Schema
 
-Copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml` and fill in your Supabase keys. The dashboard falls back to local files if Supabase credentials are missing.
+Open the Supabase SQL Editor for your project:
+
+```
+https://app.supabase.com/project/YOUR_PROJECT/_/sql
+```
+
+Paste and run the contents of:
+
+```
+supabase_setup_trader.sql   ← in this repo
+```
+
+This creates three tables with RLS policies:
+
+| Table | Purpose |
+|---|---|
+| `trader_trades` | Trade event log (mirrors `logs/trades.jsonl`) |
+| `trader_status` | Trader run status (mirrors `data/status.json`) |
+| `trader_config` | Strategy YAML snapshot (mirrors `config/strategy.yaml`) |
+
+### Step 3 — Configure Trader Environment
+
+In the trader's `.env` (or shell environment):
+
+```bash
+# Trader-side: where to push data
+SUPABASE_URL=https://YOUR_PROJECT_ID.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=your_service_role_secret_here
+SUPABASE_OWNER=admin                      # must match dashboard setting
+```
+
+Then install the Supabase Python client in the trader venv:
+
+```bash
+cd alpaca-paper-trader
+source venv/bin/activate
+pip install supabase-py>=2.0
+```
+
+The trader calls `sync_supabase.py`'s `sync_all()` automatically at the end of each run — no manual steps needed.
+
+### Step 4 — Add Supabase Secrets to Streamlit Cloud
+
+In your Streamlit Cloud app settings (Advanced → Secrets):
+
+```toml
+SUPABASE_URL = "https://YOUR_PROJECT_ID.supabase.co"
+SUPABASE_SERVICE_ROLE_KEY = "your_service_role_secret_here"
+SUPABASE_OWNER = "admin"
+```
+
+### How the Sync Works
+
+```
+Trader runs (any backend)
+  └─ writes logs/trades.jsonl, data/status.json, config/strategy.yaml
+  └─ sync_supabase.py → Supabase (HTTP POST)
+
+Dashboard reads (Streamlit Cloud)
+  └─ app.py → Supabase (HTTP GET)
+  └─ Falls back to local files if Supabase unavailable (local dev mode)
+```
+
+### Data Freshness
+
+- Trades: new lines synced via cursor tracking (only new entries sent per run)
+- Status: upserted per run (last run timestamp)
+- Config: upserted per run (full config JSON)
+
+### Local Development
+
+The dashboard falls back to reading local files if Supabase credentials are not set. Run the dashboard locally while the trader runs on a server — just point `CONFIG_PATH`, `TRADES_LOG`, and `STATUS_FILE` environment variables at the local trader directory.
+
+### Supabase Row-Level Security (RLS) Notes
+
+All three tables use `owner TEXT DEFAULT 'admin'` with RLS policies scoped to `owner = current_user`. Since you're using the **service_role key** (bypasses RLS), all rows are visible regardless of owner tag. To restrict to the `SUPABASE_OWNER` value, either:
+- Use the **anon key** instead (requires `anon` key and `auth.uid()` mapping — more setup)
+- Or keep service role key (simpler for single-user)
+
+For multi-user sharing: use anon key + per-user owner tags + shared dashboard with a user picker.
 
 ---
 

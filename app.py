@@ -24,6 +24,13 @@ from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
+# Supabase (optional)
+try:
+    from supabase import create_client
+    _HAS_SUPABASE = True
+except ImportError:
+    _HAS_SUPABASE = False
+
 # ─── Page Configuration ───────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Alcapa Dashboard",
@@ -54,6 +61,30 @@ CONFIG_PATH = os.getenv("CONFIG_PATH", "config/strategy.yaml")
 TRADES_LOG = os.getenv("TRADES_LOG", "logs/trades.jsonl")
 STATUS_FILE = os.getenv("STATUS_FILE", "data/status.json")
 AUTO_REFRESH_INTERVAL = int(get_secret("AUTO_REFRESH_INTERVAL", "60"))
+SUPABASE_OWNER = get_secret("SUPABASE_OWNER", os.getenv("SUPABASE_OWNER", "admin"))
+
+# ─── Supabase Client ───────────────────────────────────────────────────────────
+@st.cache_resource(ttl=60)
+def get_supabase_client():
+    """Return Supabase client if configured, else None.
+    
+    Service role key is preferred for server-side dashboards (bypasses RLS).
+    Falls back to anon key if service role key is not set.
+    """
+    if not _HAS_SUPABASE:
+        return None
+    url = get_secret("SUPABASE_URL", os.getenv("SUPABASE_URL"))
+    # Prefer service role key (server-side, bypasses RLS), fall back to anon key
+    service_key = get_secret("SUPABASE_SERVICE_ROLE_KEY", os.getenv("SUPABASE_SERVICE_ROLE_KEY", ""))
+    anon_key = get_secret("SUPABASE_ANON_KEY", os.getenv("SUPABASE_ANON_KEY", ""))
+    key = service_key or anon_key
+    if not url or not key:
+        return None
+    try:
+        return create_client(url, key)
+    except Exception as e:
+        logger.warning(f"Supabase client failed: {e}")
+        return None
 
 # ─── Client Factory ─────────────────────────────────────────────────────────────
 @st.cache_resource(ttl=300)
@@ -216,7 +247,28 @@ def fetch_orders(client: TradingClient, status="all", limit=50) -> pd.DataFrame:
 
 
 def load_trades_log(path: str, limit: int = 200) -> pd.DataFrame:
-    """Load trades from the JSONL log file."""
+    """Load trades from Supabase (primary) with local file fallback."""
+    sb = get_supabase_client()
+    if sb:
+        try:
+            resp = (
+                sb.table('trader_trades')
+                .select('*')
+                .eq('owner', SUPABASE_OWNER)
+                .order('created_at', desc=True)
+                .limit(limit)
+                .execute()
+            )
+            rows = resp.data
+            if not rows:
+                return pd.DataFrame()
+            df = pd.DataFrame(rows)
+            if 'timestamp' in df.columns:
+                df['timestamp'] = pd.to_datetime(df['timestamp']).dt.tz_convert('Asia/Singapore')
+            return df
+        except Exception as e:
+            logger.warning(f'Supabase trades query failed: {e}')
+    # Fallback to local file
     if not os.path.exists(path):
         return pd.DataFrame()
     try:
@@ -241,7 +293,30 @@ def load_trades_log(path: str, limit: int = 200) -> pd.DataFrame:
 
 
 def load_status_json(path: str) -> Dict:
-    """Load the status JSON file."""
+    """Load status from Supabase (most recent row) with local file fallback."""
+    sb = get_supabase_client()
+    if sb:
+        try:
+            resp = (
+                sb.table('trader_status')
+                .select('*')
+                .eq('owner', SUPABASE_OWNER)
+                .order('created_at', desc=True)
+                .limit(1)
+                .execute()
+            )
+            rows = resp.data
+            if rows:
+                row = rows[0]
+                return {
+                    'last_run': row.get('last_run'),
+                    'status': row.get('status'),
+                    'duration_sec': row.get('duration_sec'),
+                    'extra': row.get('extra') or {},
+                }
+        except Exception as e:
+            logger.warning(f'Supabase status query failed: {e}')
+    # Fallback to local file
     if not os.path.exists(path):
         return {}
     try:
@@ -252,7 +327,24 @@ def load_status_json(path: str) -> Dict:
 
 
 def load_strategy_config(path: str) -> Dict:
-    """Load the strategy YAML config."""
+    """Load strategy config from Supabase (latest) with local file fallback."""
+    sb = get_supabase_client()
+    if sb:
+        try:
+            resp = (
+                sb.table('trader_config')
+                .select('config_json, updated_at')
+                .eq('owner', SUPABASE_OWNER)
+                .order('updated_at', desc=True)
+                .limit(1)
+                .execute()
+            )
+            rows = resp.data
+            if rows:
+                return rows[0].get('config_json', {})
+        except Exception as e:
+            logger.warning(f'Supabase config query failed: {e}')
+    # Fallback to local file
     if not os.path.exists(path):
         return {}
     try:

@@ -18,7 +18,7 @@ from plotly.subplots import make_subplots
 import plotly.express as px
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import GetOrdersRequest, GetPositionRequest
+from alpaca.trading.requests import GetOrdersRequest
 from alpaca.trading.enums import OrderStatus
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest

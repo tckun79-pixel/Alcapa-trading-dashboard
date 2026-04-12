@@ -20,6 +20,7 @@ import plotly.express as px
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import GetOrdersRequest
 from alpaca.trading.enums import OrderStatus
+# Note: GetPositionRequest does not exist in alpaca-py; positions fetched via client.get_all_positions()
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame

@@ -1,96 +1,136 @@
 """
-Alpaca Trading Dashboard — Streamlit Application
-Monitor your Alpaca paper trading account, positions, performance, and strategies.
-Streamlit Cloud-ready with secure secrets management.
+Alcapa Trading Dashboard — Streamlit Application
+Local-debug friendly version for WSL2 / Streamlit.
 """
 
-import streamlit as st
-import os
 import json
-import time
 import logging
-from datetime import datetime, timedelta, date
-from typing import Optional, Dict, Any, List
+import os
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Dict, Optional
 
 import pandas as pd
 import plotly.graph_objects as go
+import requests
+import streamlit as st
 from plotly.subplots import make_subplots
-import plotly.express as px
 
 from alpaca.trading.client import TradingClient
+from alpaca.trading.enums import QueryOrderStatus
 from alpaca.trading.requests import GetOrdersRequest
-from alpaca.trading.enums import OrderStatus
-# Note: GetPositionRequest does not exist in alpaca-py; positions fetched via client.get_all_positions()
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
 
-import requests
-
-# ─── Page Configuration ───────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Alcapa Dashboard",
     page_icon="📊",
     layout="wide",
-    menu_items={
-        "About": "Alpaca Paper Trading Dashboard — built for CK's options strategies",
-    },
+    menu_items={"About": "Alpaca Paper Trading Dashboard — local debug build"},
 )
 
-# ─── Logging ───────────────────────────────────────────────────────────────────
 logger = logging.getLogger("dashboard")
 
-# ─── Secrets / Env ─────────────────────────────────────────────────────────────
+PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_SECRETS = PROJECT_ROOT / ".streamlit" / "secrets.toml"
+GLOBAL_SECRETS = Path.home() / ".streamlit" / "secrets.toml"
+
+
+def has_any_secrets_file() -> bool:
+    return PROJECT_SECRETS.exists() or GLOBAL_SECRETS.exists()
+
+
 def get_secret(key: str, default=None):
-    """Fetch from Streamlit secrets (cloud) or environment (local)."""
+    env_val = os.getenv(key)
+    if env_val not in (None, ""):
+        return env_val
+
+    if has_any_secrets_file():
+        try:
+            return st.secrets[key]
+        except Exception:
+            pass
+
+    return default
+
+
+API_KEY = get_secret("APCA_API_KEY_ID")
+API_SECRET = get_secret("APCA_API_SECRET_KEY")
+PAPER_MODE = str(get_secret("APCA_API_PAPER", "true")).lower() == "true"
+
+CONFIG_PATH = get_secret("CONFIG_PATH", "config/strategy.yaml")
+TRADES_LOG = get_secret("TRADES_LOG", "logs/trades.jsonl")
+STATUS_FILE = get_secret("STATUS_FILE", "data/status.json")
+SUPABASE_URL = get_secret("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = get_secret("SUPABASE_SERVICE_ROLE_KEY") or get_secret("SUPABASE_ANON_KEY")
+
+
+def safe_float(value, default=0.0) -> float:
     try:
-        return st.secrets[key]
+        return float(value)
     except Exception:
-        return os.getenv(key, default)
+        return float(default)
 
 
-API_KEY = get_secret("APCA_API_KEY_ID", os.getenv("APCA_API_KEY_ID"))
-API_SECRET = get_secret("APCA_API_SECRET_KEY", os.getenv("APCA_API_SECRET_KEY"))
-PAPER_MODE = get_secret("APCA_API_PAPER", "true").lower() == "true"
+def file_exists(path: str) -> bool:
+    try:
+        return Path(path).exists()
+    except Exception:
+        return False
 
-CONFIG_PATH = os.getenv("CONFIG_PATH", "config/strategy.yaml")
-TRADES_LOG = os.getenv("TRADES_LOG", "logs/trades.jsonl")
-STATUS_FILE = os.getenv("STATUS_FILE", "data/status.json")
-AUTO_REFRESH_INTERVAL = int(get_secret("AUTO_REFRESH_INTERVAL", "60"))
-SUPABASE_OWNER = get_secret("SUPABASE_OWNER", os.getenv("SUPABASE_OWNER", "admin"))
 
-# ─── Supabase Direct Access ─────────────────────────────────────────────────
-SUPABASE_URL = get_secret("SUPABASE_URL", os.getenv("SUPABASE_URL"))
-SUPABASE_SERVICE_ROLE_KEY = get_secret("SUPABASE_SERVICE_ROLE_KEY", os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_ANON_KEY"))
+def to_sgt(series: pd.Series) -> pd.Series:
+    ts = pd.to_datetime(series, errors="coerce", utc=True)
+    return ts.dt.tz_convert("Asia/Singapore")
+
+
+def format_currency(value):
+    if value is None or value == "":
+        return "—"
+    try:
+        return f"${float(value):,.2f}"
+    except Exception:
+        return str(value)
+
+
+def get_last_refreshed():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S SGT")
+
+
+def has_cols(df: pd.DataFrame, cols) -> bool:
+    return all(c in df.columns for c in cols)
+
 
 def _supabase_headers():
-    """Return headers for Supabase REST API using service role key."""
     if not SUPABASE_SERVICE_ROLE_KEY:
         return {}
     return {
         "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
         "Content-Type": "application/json",
         "Prefer": "return=representation",
     }
 
 
 def query_supabase(table: str, params: dict = None) -> Optional[list]:
-    """Generic GET from Supabase REST API. Returns list of records or None."""
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
         return None
-    url = f"{SUPABASE_URL}/rest/v1/{table}"
+
+    url = f"{SUPABASE_URL.rstrip('/')}/rest/v1/{table}"
     try:
-        resp = requests.get(url, headers=_supabase_headers(), params=params, timeout=10)
-        resp.raise_for_status()
-        return resp.json()
+        response = requests.get(
+            url,
+            headers=_supabase_headers(),
+            params=params or {},
+            timeout=10,
+        )
+        response.raise_for_status()
+        return response.json()
     except Exception as e:
-        logger.warning(f"Supabase query error for table '{table}': {e}")
+        logger.warning(f"Supabase query error for {table}: {e}")
         return None
 
-# ─── Client Factory ─────────────────────────────────────────────────────────────
+
 @st.cache_resource(ttl=300)
 def get_trading_client():
-    """Cached Alpaca trading client."""
     if not API_KEY or not API_SECRET:
         return None
     try:
@@ -99,83 +139,27 @@ def get_trading_client():
             secret_key=API_SECRET,
             paper=PAPER_MODE,
         )
-        # Verify credentials with a simple call
-        _ = client.get_account()
+        client.get_account()
         return client
     except Exception as e:
-        st.error(f"Failed to connect to Alpaca: {e}")
+        logger.warning(f"Failed to connect to Alpaca: {e}")
         return None
-
-
-@st.cache_resource(ttl=300)
-def get_data_client():
-    """Cached Alpaca data client for market data."""
-    if not API_KEY or not API_SECRET:
-        return None
-    try:
-        return StockHistoricalDataClient(
-            api_key=API_KEY,
-            secret_key=API_SECRET,
-        )
-    except Exception:
-        return None
-
-# ─── State ───────────────────────────────────────────────────────────────────────
-if "last_refresh" not in st.session_state:
-    st.session_state.last_refresh = None
-if "strategy_config" not in st.session_state:
-    st.session_state.strategy_config = None
-if "positions_df" not in st.session_state:
-    st.session_state.positions_df = None
-if "account_data" not in st.session_state:
-    st.session_state.account_data = None
-if "orders_df" not in st.session_state:
-    st.session_state.orders_df = None
-if "trades_df" not in st.session_state:
-    st.session_state.trades_df = None
-
-# ─── Helpers ────────────────────────────────────────────────────────────────────
-
-def format_currency(value, currency="USD"):
-    if value is None:
-        return "—"
-    try:
-        return f"${float(value):,.2f}"
-    except (TypeError, ValueError):
-        return str(value)
-
-
-def format_pct(value):
-    if value is None:
-        return "—"
-    try:
-        v = float(value)
-        color = "green" if v >= 0 else "red"
-        return f"<span style='color:{color}'>{v:+.2f}%</span>"
-    except (TypeError, ValueError):
-        return str(value)
-
-
-def get_last_refreshed():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S SGT")
 
 
 def fetch_account(client: TradingClient) -> Optional[Dict]:
-    """Fetch account information."""
+    if not client:
+        return None
     try:
         account = client.get_account()
         return {
-            "account_fractional": account.account_fractional,
-            "cash": account.cash,
-            "portfolio_float_pct": account.portfolio_float_pct,
-            "portfolio_unrealized_pl": account.portfolio_unrealized_pl,
-            "currency": account.currency,
-            "buying_power": account.buying_power,
-            "equity": account.equity,
-            "id": account.id,
-            "initial_equity": account.initial_equity,
-            "sma": account.sma,
-            "status": account.status,
+            "cash": getattr(account, "cash", None),
+            "buying_power": getattr(account, "buying_power", None),
+            "equity": getattr(account, "equity", None),
+            "initial_equity": getattr(account, "initial_equity", None) or getattr(account, "last_equity", None),
+            "last_equity": getattr(account, "last_equity", None),
+            "currency": getattr(account, "currency", None),
+            "status": getattr(account, "status", None),
+            "id": getattr(account, "id", None),
         }
     except Exception as e:
         logger.warning(f"get_account error: {e}")
@@ -183,96 +167,131 @@ def fetch_account(client: TradingClient) -> Optional[Dict]:
 
 
 def fetch_positions(client: TradingClient) -> pd.DataFrame:
-    """Fetch all open positions."""
+    if not client:
+        return pd.DataFrame()
+
     try:
         positions = client.get_all_positions()
-        if not positions:
-            return pd.DataFrame()
         rows = []
-        for p in positions:
-            rows.append({
-                "symbol": p.symbol,
-                "qty": p.qty,
-                "avg_price": p.avg_entry_price,
-                "current_price": p.current_price,
-                "market_value": p.market_value,
-                "unrealized_pl": p.unrealized_pl,
-                "unrealized_pl_pct": p.unrealized_plpc,
-                "side": p.side,
-                "qty_available": p.qty_available,
-            })
+        for p in positions or []:
+            rows.append(
+                {
+                    "symbol": p.symbol,
+                    "qty": p.qty,
+                    "avg_price": p.avg_entry_price,
+                    "current_price": p.current_price,
+                    "market_value": p.market_value,
+                    "unrealized_pl": p.unrealized_pl,
+                    "unrealized_pl_pct": p.unrealized_plpc,
+                    "side": p.side,
+                    "qty_available": p.qty_available,
+                }
+            )
         return pd.DataFrame(rows)
     except Exception as e:
         logger.warning(f"get_all_positions error: {e}")
         return pd.DataFrame()
 
 
-def fetch_orders(client: TradingClient, status="all", limit=50) -> pd.DataFrame:
-    """Fetch orders."""
+def fetch_orders(client: TradingClient, status="all", limit=100) -> pd.DataFrame:
+    if not client:
+        return pd.DataFrame()
+
     try:
         status_map = {
-            "open": OrderStatus.OPEN,
-            "closed": OrderStatus.CLOSED,
-            "all": None,
+            "open": QueryOrderStatus.OPEN,
+            "closed": QueryOrderStatus.CLOSED,
+            "all": QueryOrderStatus.ALL,
         }
-        req_status = status_map.get(status)
-        if req_status:
-            orders_req = GetOrdersRequest(status=req_status, limit=limit)
-        else:
-            orders_req = GetOrdersRequest(limit=limit)
-        orders = client.get_orders(orders_req)
-        if not orders:
-            return pd.DataFrame()
+
+        request = GetOrdersRequest(
+            status=status_map.get(status, QueryOrderStatus.ALL),
+            limit=limit,
+        )
+
+        orders = client.get_orders(filter=request)
+
         rows = []
-        for o in orders:
-            rows.append({
-                "id": o.id,
-                "symbol": o.symbol,
-                "side": o.side,
-                "qty": o.qty,
-                "filled_qty": o.filled_qty,
-                "status": o.status,
-                "order_type": o.order_type,
-                "created_at": o.created_at,
-                "filled_at": o.filled_at,
-                "limit_price": o.limit_price,
-                "stop_price": o.stop_price,
-            })
+        for o in orders or []:
+            rows.append(
+                {
+                    "id": str(getattr(o, "id", "")),
+                    "symbol": getattr(o, "symbol", None),
+                    "side": str(getattr(o, "side", "")),
+                    "qty": getattr(o, "qty", None),
+                    "filled_qty": getattr(o, "filled_qty", None),
+                    "status": str(getattr(o, "status", "")),
+                    "order_type": str(getattr(o, "order_type", "")),
+                    "created_at": getattr(o, "created_at", None),
+                    "filled_at": getattr(o, "filled_at", None),
+                    "limit_price": getattr(o, "limit_price", None),
+                    "stop_price": getattr(o, "stop_price", None),
+                }
+            )
+
         df = pd.DataFrame(rows)
-        if "created_at" in df.columns:
-            df["created_at"] = pd.to_datetime(df["created_at"]).dt.tz_convert("Asia/Singapore")
+        if not df.empty:
+            if "created_at" in df.columns:
+                df["created_at"] = to_sgt(df["created_at"])
+            if "filled_at" in df.columns:
+                df["filled_at"] = to_sgt(df["filled_at"])
         return df
     except Exception as e:
         logger.warning(f"get_orders error: {e}")
         return pd.DataFrame()
 
 
-def load_trades_log(path: str, limit: int = 200) -> pd.DataFrame:
-    """Load trades from Supabase (primary) with local file fallback."""
-    rows = query_supabase('trader_trades', params={'order': 'created_at.desc', 'limit': str(limit)})
+def get_clock(client: TradingClient) -> Dict:
+    if not client:
+        return {}
+    try:
+        clock = client.get_clock()
+        return {
+            "is_open": clock.is_open,
+            "next_open": clock.next_open,
+            "next_close": clock.next_close,
+            "timestamp": clock.timestamp,
+        }
+    except Exception as e:
+        logger.warning(f"get_clock error: {e}")
+        return {}
+
+
+def load_trades_log(path: str, limit: int = 500) -> pd.DataFrame:
+    rows = query_supabase(
+        "trader_trades",
+        params={"select": "*", "order": "created_at.desc", "limit": str(limit)},
+    )
     if rows:
         df = pd.DataFrame(rows)
-        if 'timestamp' in df.columns:
-            df['timestamp'] = pd.to_datetime(df['timestamp']).dt.tz_convert('Asia/Singapore')
+        if "timestamp" in df.columns:
+            df["timestamp"] = to_sgt(df["timestamp"])
+        elif "created_at" in df.columns:
+            df["timestamp"] = to_sgt(df["created_at"])
         return df
-    # Fallback local
-    if not os.path.exists(path):
+
+    if not file_exists(path):
         return pd.DataFrame()
+
     try:
         entries = []
-        with open(path, "r") as f:
+        with open(path, "r", encoding="utf-8") as f:
             for i, line in enumerate(f):
                 if i >= limit:
                     break
+                line = line.strip()
+                if not line:
+                    continue
                 try:
                     entries.append(json.loads(line))
                 except json.JSONDecodeError:
                     continue
-        if not entries:
-            return pd.DataFrame()
+
         df = pd.DataFrame(entries)
         if "timestamp" in df.columns:
-            df["timestamp"] = pd.to_datetime(df["timestamp"]).dt.tz_convert("Asia/Singapore")
+            df["timestamp"] = to_sgt(df["timestamp"])
+        elif "created_at" in df.columns:
+            df["timestamp"] = to_sgt(df["created_at"])
         return df
     except Exception as e:
         logger.warning(f"load_trades_log error: {e}")
@@ -280,65 +299,71 @@ def load_trades_log(path: str, limit: int = 200) -> pd.DataFrame:
 
 
 def load_status_json(path: str) -> Dict:
-    """Load status from Supabase (most recent row) with local file fallback."""
-    rows = query_supabase('trader_status', params={'order': 'created_at.desc', 'limit': '1'})
+    rows = query_supabase(
+        "trader_status",
+        params={"select": "*", "order": "created_at.desc", "limit": "1"},
+    )
     if rows:
         row = rows[0]
         return {
-            'last_run': row.get('last_run'),
-            'status': row.get('status'),
-            'duration_sec': row.get('duration_sec'),
-            'extra': row.get('extra') or {},
+            "last_run": row.get("last_run"),
+            "status": row.get("status"),
+            "duration_sec": row.get("duration_sec"),
+            "extra": row.get("extra") or {},
         }
-    # Fallback
-    if not os.path.exists(path):
+
+    if not file_exists(path):
         return {}
+
     try:
-        with open(path) as f:
+        with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
-    except Exception:
+    except Exception as e:
+        logger.warning(f"load_status_json error: {e}")
         return {}
 
 
 def load_strategy_config(path: str) -> Dict:
-    """Load strategy config from Supabase (latest) with local file fallback."""
-    rows = query_supabase('trader_config', params={'order': 'updated_at.desc', 'limit': '1'})
+    rows = query_supabase(
+        "trader_config",
+        params={"select": "*", "order": "updated_at.desc", "limit": "1"},
+    )
     if rows:
         row = rows[0]
-        return row.get('config_json', {})
-    # Fallback
-    if not os.path.exists(path):
+        return row.get("config_json", {}) or {}
+
+    if not file_exists(path):
         return {}
+
     try:
         import yaml
-        with open(path) as f:
-            return yaml.safe_load(f)
-    except Exception:
+        with open(path, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    except Exception as e:
+        logger.warning(f"load_strategy_config error: {e}")
         return {}
 
 
 def get_equity_curve(trades_df: pd.DataFrame, initial_balance: float = 100000.0) -> pd.DataFrame:
-    """Build equity curve from trade log."""
-    if trades_df.empty or "timestamp" not in trades_df.columns:
+    if trades_df.empty or not has_cols(trades_df, ["timestamp", "action", "pnl"]):
         return pd.DataFrame()
-    # Filter closed trades with pnl
+
     closed = trades_df[trades_df["action"] == "close"].copy()
     if closed.empty:
         return pd.DataFrame()
+
     closed = closed.sort_values("timestamp")
-    equity = [initial_balance]
-    times = [pd.Timestamp(closed["timestamp"].iloc[0]) if not closed.empty else pd.Timestamp.now()]
+    running = initial_balance
+    curve = []
+
     for _, row in closed.iterrows():
-        pnl = float(row.get("pnl") or 0)
-        equity.append(equity[-1] + pnl)
-        times.append(row["timestamp"])
-    if len(equity) < 2:
-        return pd.DataFrame()
-    return pd.DataFrame({"timestamp": times[1:], "equity": equity[1:]})
+        running += safe_float(row.get("pnl"), 0.0)
+        curve.append({"timestamp": row["timestamp"], "equity": running})
+
+    return pd.DataFrame(curve)
 
 
-def get_performance_metrics(trades_df: pd.DataFrame, account_df: pd.DataFrame, initial_balance: float = 100000.0) -> Dict:
-    """Compute performance metrics from trade log."""
+def get_performance_metrics(trades_df: pd.DataFrame, initial_balance: float = 100000.0) -> Dict:
     metrics = {
         "total_trades": 0,
         "closed_trades": 0,
@@ -350,133 +375,129 @@ def get_performance_metrics(trades_df: pd.DataFrame, account_df: pd.DataFrame, i
         "avg_loss": 0.0,
         "avg_pnl": 0.0,
     }
+
     if trades_df.empty:
         return metrics
-    all_trades = len(trades_df)
-    closed = trades_df[trades_df["action"] == "close"]
-    closed_count = len(closed)
-    metrics["total_trades"] = all_trades
-    metrics["closed_trades"] = closed_count
-    if closed_count == 0:
+
+    metrics["total_trades"] = len(trades_df)
+
+    if not has_cols(trades_df, ["action", "pnl"]):
         return metrics
-    pnl_vals = closed["pnl"].dropna().astype(float)
+
+    closed = trades_df[trades_df["action"] == "close"].copy()
+    metrics["closed_trades"] = len(closed)
+    if closed.empty:
+        return metrics
+
+    pnl_vals = pd.to_numeric(closed["pnl"], errors="coerce").dropna()
     if pnl_vals.empty:
         return metrics
+
     metrics["winning_trades"] = int((pnl_vals > 0).sum())
     metrics["losing_trades"] = int((pnl_vals < 0).sum())
     metrics["total_pnl"] = float(pnl_vals.sum())
-    metrics["win_rate"] = metrics["winning_trades"] / closed_count * 100
+    metrics["win_rate"] = (metrics["winning_trades"] / len(pnl_vals)) * 100 if len(pnl_vals) else 0.0
+
     wins = pnl_vals[pnl_vals > 0]
     losses = pnl_vals[pnl_vals < 0]
+
     if not wins.empty:
         metrics["avg_win"] = float(wins.mean())
     if not losses.empty:
         metrics["avg_loss"] = float(losses.mean())
     metrics["avg_pnl"] = float(pnl_vals.mean())
+
     return metrics
 
 
 def get_strategy_status(config: Dict) -> pd.DataFrame:
-    """Build strategy status table from config."""
     strategies = []
-    for name, section in config.items():
-        if name == "account":
+    for name, section in (config or {}).items():
+        if name == "account" or not isinstance(section, dict):
             continue
-        if isinstance(section, dict):
-            strategies.append({
+        strategies.append(
+            {
                 "strategy": name,
                 "enabled": "✅ Active" if section.get("enabled", False) else "❌ Disabled",
                 "underlying": section.get("underlying", section.get("symbols", "—")),
                 "data_source": section.get("data_source", "—"),
                 "confirm_required": "🔐 Yes" if section.get("require_confirmation", False) else "🔓 No",
-            })
+            }
+        )
     return pd.DataFrame(strategies)
 
 
-def get_clock(client: TradingClient) -> Dict:
-    """Get market clock / trading hours."""
-    try:
-        clock = client.get_clock()
-        return {
-            "is_open": clock.is_open,
-            "next_open": clock.next_open,
-            "next_close": clock.next_close,
-            "timestamp": clock.timestamp,
-        }
-    except Exception:
-        return {}
-
-
-# ─── Sidebar ────────────────────────────────────────────────────────────────────
 def render_sidebar():
     with st.sidebar:
         st.title("📊 Alcapa Dashboard")
-        st.markdown("---")
         st.caption(f"Last updated: {get_last_refreshed()}")
-        if st.button("🔄 Refresh Data"):
-            st.cache_data.clear()
+
+        if st.button("🔄 Refresh now"):
+            st.cache_resource.clear()
             st.rerun()
 
         st.markdown("---")
-        st.subheader("Auto-refresh")
-        interval = st.selectbox(
-            "Interval",
-            options=[0, 30, 60, 120, 300],
-            format_func=lambda x: "Off" if x == 0 else f"{x}s",
-            index=2,
+        page = st.radio(
+            "Navigate",
+            ["Overview", "Positions", "Performance", "Strategies", "Trade Log", "Settings"],
         )
-        if interval > 0:
-            time.sleep(interval)
-            st.rerun()
+
+        st.markdown("---")
+        st.subheader("Environment")
+        st.write(f"**Paper mode:** `{PAPER_MODE}`")
+        st.write(f"**Project secrets:** `{PROJECT_SECRETS}`")
+        st.write(f"**Secrets file found:** `{'Yes' if has_any_secrets_file() else 'No'}`")
 
         st.markdown("---")
         st.subheader("Account")
         client = get_trading_client()
         if client:
-            try:
-                account = client.get_account()
-                st.metric("Equity", format_currency(account.equity))
-                st.metric("Cash", format_currency(account.cash))
-                st.metric("Buying Power", format_currency(account.buying_power))
-            except Exception as e:
-                st.error(f"Account error: {e}")
+            account = fetch_account(client)
+            if account:
+                st.metric("Equity", format_currency(account.get("equity")))
+                st.metric("Cash", format_currency(account.get("cash")))
+                st.metric("Buying Power", format_currency(account.get("buying_power")))
+            else:
+                st.warning("Connected, but account data could not be fetched.")
         else:
-            st.warning("Connect your Alpaca API keys to see account info.")
+            st.info("No Alpaca connection yet. Add API keys in .streamlit/secrets.toml or env vars.")
 
         st.markdown("---")
         st.subheader("Market Status")
         if client:
-            try:
-                clock = get_clock(client)
-                if clock:
-                    status = "🟢 OPEN" if clock["is_open"] else "🔴 CLOSED"
-                    st.write(f"**US Equities:** {status}")
-                    if not clock["is_open"]:
-                        if clock.get("next_open"):
-                            st.caption(f"Next open: {clock['next_open']}")
-                        if clock.get("next_close"):
-                            st.caption(f"Next close: {clock['next_close']}")
-            except Exception:
-                st.info("Market clock unavailable")
-        st.markdown("---")
-        st.caption("Streamlit Cloud ready | Paper trading only")
+            clock = get_clock(client)
+            if clock:
+                status = "🟢 OPEN" if clock["is_open"] else "🔴 CLOSED"
+                st.write(f"**US Equities:** {status}")
+                if clock.get("next_open"):
+                    st.caption(f"Next open: {clock['next_open']}")
+                if clock.get("next_close"):
+                    st.caption(f"Next close: {clock['next_close']}")
+            else:
+                st.caption("Market clock unavailable.")
+        else:
+            st.caption("Market clock unavailable without API credentials.")
+
+    return page
 
 
-# ─── Page: Dashboard Overview ────────────────────────────────────────────────────
-def render_overview(client: TradingClient):
+def render_overview():
     st.title("📈 Dashboard Overview")
+
+    client = get_trading_client()
+    if not client:
+        st.warning("Add Alpaca paper API credentials to load live account data.")
+        return
 
     account = fetch_account(client)
     positions = fetch_positions(client)
-    today_trades = pd.DataFrame()  # filtered separately
 
-    # Account metrics row
     col1, col2, col3, col4 = st.columns(4)
     if account:
-        initial = float(account.get("initial_equity", initial_balance) or initial_balance)
-        equity = float(account.get("equity", initial))
+        initial = safe_float(account.get("initial_equity") or account.get("last_equity"), 100000.0)
+        equity = safe_float(account.get("equity"), initial)
         pnl = equity - initial
-        pnl_pct = (pnl / initial) * 100 if initial > 0 else 0
+
         with col1:
             st.metric("Equity", format_currency(equity), delta=format_currency(pnl))
         with col2:
@@ -484,49 +505,39 @@ def render_overview(client: TradingClient):
         with col3:
             st.metric("Buying Power", format_currency(account.get("buying_power")))
         with col4:
-            if positions is not None and not positions.empty:
-                total_mv = positions["market_value"].astype(float).sum()
+            if not positions.empty and "market_value" in positions.columns:
+                total_mv = pd.to_numeric(positions["market_value"], errors="coerce").fillna(0).sum()
                 st.metric("Positions Value", format_currency(total_mv))
             else:
                 st.metric("Positions Value", "—")
     else:
-        st.warning("Could not fetch account data. Check your API keys.")
+        st.warning("Could not fetch account data.")
 
     st.markdown("---")
 
-    # Positions summary
     if not positions.empty:
         col_a, col_b = st.columns(2)
+
         with col_a:
             st.subheader("Open Positions")
             pos_display = positions.copy()
-            pos_display["unrealized_pl_pct"] = pos_display["unrealized_pl_pct"].apply(
-                lambda x: f"{float(x):+.2f}%" if x else "—"
-            )
-            st.dataframe(
-                pos_display[["symbol", "qty", "avg_price", "current_price", "market_value", "unrealized_pl", "unrealized_pl_pct", "side"]],
-                use_container_width=True,
-                hide_index=True,
-            )
+            if "unrealized_pl_pct" in pos_display.columns:
+                pos_display["unrealized_pl_pct"] = pos_display["unrealized_pl_pct"].apply(
+                    lambda x: f"{safe_float(x) * 100:+.2f}%" if x not in (None, "") else "—"
+                )
+            st.dataframe(pos_display, use_container_width=True, hide_index=True)
+
         with col_b:
             st.subheader("Position P&L")
-            fig = make_subplots(specs=[[{"secondary_y": True}]])
+            fig = make_subplots(specs=[[{"secondary_y": False}]])
             for _, row in positions.iterrows():
-                sym = row["symbol"]
-                pl = float(row.get("unrealized_pl") or 0)
+                sym = row.get("symbol", "—")
+                pl = safe_float(row.get("unrealized_pl"), 0.0)
                 color = "#22c55e" if pl >= 0 else "#ef4444"
-                fig.add_trace(
-                    go.Bar(
-                        x=[sym],
-                        y=[pl],
-                        marker_color=color,
-                        name=sym,
-                    ),
-                    secondary_y=False,
-                )
+                fig.add_trace(go.Bar(x=[sym], y=[pl], marker_color=color, name=sym))
             fig.update_layout(
                 title="Unrealized P&L by Symbol",
-                height=300,
+                height=320,
                 showlegend=False,
                 margin=dict(l=20, r=20, t=40, b=20),
             )
@@ -536,52 +547,45 @@ def render_overview(client: TradingClient):
 
     st.markdown("---")
 
-    # Today's activity from orders
-    today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
     orders_today = fetch_orders(client, status="all", limit=100)
     if not orders_today.empty and "created_at" in orders_today.columns:
+        today_start = pd.Timestamp.now(tz="Asia/Singapore").normalize()
         orders_today = orders_today[orders_today["created_at"] >= today_start]
+
     if not orders_today.empty:
         st.subheader("Today's Orders")
-        display_cols = ["symbol", "side", "qty", "filled_qty", "status", "created_at"]
-        avail = [c for c in display_cols if c in orders_today.columns]
-        st.dataframe(orders_today[avail], use_container_width=True, hide_index=True)
+        st.dataframe(orders_today, use_container_width=True, hide_index=True)
     else:
         st.info("No orders today.")
 
 
-# ─── Page: Positions ───────────────────────────────────────────────────────────
-def render_positions(client: TradingClient):
+def render_positions():
     st.title("💼 Positions")
-    st.caption(f"Last updated: {get_last_refreshed()}")
+
+    client = get_trading_client()
+    if not client:
+        st.warning("Add Alpaca API credentials to load positions and orders.")
+        return
 
     tab1, tab2 = st.tabs(["📋 Open Positions", "📜 Order History"])
 
     with tab1:
         positions = fetch_positions(client)
         if not positions.empty:
-            col_sym, col_side = st.columns(2)
-            with col_sym:
+            col1, col2 = st.columns(2)
+            with col1:
                 filter_sym = st.text_input("Filter by symbol", "").upper()
-            with col_side:
-                filter_side = st.selectbox("Side", options=["All", "long", "short"])
-            df = positions
-            if filter_sym:
-                df = df[df["symbol"].str.contains(filter_sym, na=False)]
-            if filter_side != "All":
-                df = df[df["side"] == filter_side]
+            with col2:
+                filter_side = st.selectbox("Side", ["All", "long", "short"])
 
-            st.dataframe(
-                df,
-                use_container_width=True,
-                hide_index=True,
-            )
-            st.download_button(
-                "Download CSV",
-                df.to_csv(index=False),
-                "positions.csv",
-                "text/csv",
-            )
+            df = positions.copy()
+            if filter_sym and "symbol" in df.columns:
+                df = df[df["symbol"].astype(str).str.contains(filter_sym, na=False)]
+            if filter_side != "All" and "side" in df.columns:
+                df = df[df["side"].astype(str) == filter_side]
+
+            st.dataframe(df, use_container_width=True, hide_index=True)
+            st.download_button("Download CSV", df.to_csv(index=False), "positions.csv", "text/csv")
         else:
             st.info("No open positions.")
 
@@ -589,59 +593,31 @@ def render_positions(client: TradingClient):
         orders = fetch_orders(client, status="all", limit=200)
         if not orders.empty:
             st.dataframe(orders, use_container_width=True, hide_index=True)
-            st.download_button(
-                "Download CSV",
-                orders.to_csv(index=False),
-                "orders.csv",
-                "text/csv",
-            )
+            st.download_button("Download CSV", orders.to_csv(index=False), "orders.csv", "text/csv")
         else:
             st.info("No order history.")
 
 
-# ─── Page: Performance ─────────────────────────────────────────────────────────
 def render_performance():
     st.title("📊 Performance")
 
     trades_df = load_trades_log(TRADES_LOG)
-    account = None
-    try:
-        client = get_trading_client()
-        if client:
-            account = fetch_account(client)
-    except Exception:
-        pass
+    client = get_trading_client()
+    account = fetch_account(client) if client else None
 
-    initial_balance = 100000.0
-    if account:
-        try:
-            ib = account.get("initial_equity")
-            if ib:
-                initial_balance = float(ib)
-        except Exception:
-            pass
-
-    col1, col2, col3, col4, col5 = st.columns(5)
-
-    # Compute metrics
-    metrics = get_performance_metrics(trades_df, account, initial_balance)
+    initial_balance = safe_float(account.get("initial_equity") or account.get("last_equity"), 100000.0) if account else 100000.0
+    metrics = get_performance_metrics(trades_df, initial_balance)
     equity_curve = get_equity_curve(trades_df, initial_balance)
 
-    with col1:
-        st.metric("Total Trades", metrics["total_trades"])
-    with col2:
-        st.metric("Closed Trades", metrics["closed_trades"])
-    with col3:
-        st.metric("Win Rate", f"{metrics['win_rate']:.1f}%")
-    with col4:
-        clr = "#22c55e" if metrics["total_pnl"] >= 0 else "#ef4444"
-        st.markdown(f"<div style='text-align:center'><big style='color:{clr}'>{metrics['total_pnl']:+.2f}</big><br><small>Total P&L</small></div>", unsafe_allow_html=True)
-    with col5:
-        st.metric("Avg P&L / Trade", f"{metrics['avg_pnl']:+.2f}")
+    col1, col2, col3, col4, col5 = st.columns(5)
+    col1.metric("Total Trades", metrics["total_trades"])
+    col2.metric("Closed Trades", metrics["closed_trades"])
+    col3.metric("Win Rate", f"{metrics['win_rate']:.1f}%")
+    col4.metric("Total P&L", f"{metrics['total_pnl']:+.2f}")
+    col5.metric("Avg P&L / Trade", f"{metrics['avg_pnl']:+.2f}")
 
     st.markdown("---")
 
-    # Equity Curve
     if not equity_curve.empty:
         st.subheader("Equity Curve")
         fig = go.Figure()
@@ -665,24 +641,15 @@ def render_performance():
         )
         st.plotly_chart(fig, use_container_width=True)
     else:
-        st.info("No equity curve data yet. Trade log is empty or no closed trades with P&L recorded.")
+        st.info("No equity curve data yet.")
 
-    # P&L Distribution
-    if not trades_df.empty:
-        closed = trades_df[trades_df["action"] == "close"]
-        pnl_vals = closed["pnl"].dropna().astype(float)
+    if not trades_df.empty and has_cols(trades_df, ["action", "pnl"]):
+        closed = trades_df[trades_df["action"] == "close"].copy()
+        pnl_vals = pd.to_numeric(closed["pnl"], errors="coerce").dropna()
         if not pnl_vals.empty:
             st.subheader("P&L Distribution")
             fig2 = go.Figure()
-            colors = ["#22c55e" if v >= 0 else "#ef4444" for v in pnl_vals]
-            fig2.add_trace(
-                go.Histogram(
-                    x=pnl_vals,
-                    marker_color=colors,
-                    nbinsx=20,
-                    name="P&L",
-                )
-            )
+            fig2.add_trace(go.Histogram(x=pnl_vals, nbinsx=20, name="P&L"))
             fig2.update_layout(
                 height=280,
                 margin=dict(l=20, r=20, t=20, b=20),
@@ -691,11 +658,16 @@ def render_performance():
             )
             st.plotly_chart(fig2, use_container_width=True)
 
-    # Strategy breakdown
-    if not trades_df.empty:
+    if not trades_df.empty and has_cols(trades_df, ["action", "strategy", "pnl"]):
         st.subheader("P&L by Strategy")
-        grp = trades_df[trades_df["action"] == "close"].groupby("strategy")["pnl"].agg(["sum", "count"]).reset_index()
+        grp = (
+            trades_df[trades_df["action"] == "close"]
+            .groupby("strategy")["pnl"]
+            .agg(["sum", "count"])
+            .reset_index()
+        )
         if not grp.empty:
+            grp["sum"] = pd.to_numeric(grp["sum"], errors="coerce").fillna(0.0)
             fig3 = go.Figure()
             fig3.add_trace(
                 go.Bar(
@@ -705,28 +677,16 @@ def render_performance():
                     text=grp["sum"].apply(lambda x: f"${x:+.2f}"),
                 )
             )
-            fig3.update_layout(height=250, margin=dict(l=20, r=20, t=20, b=20))
+            fig3.update_layout(height=280, margin=dict(l=20, r=20, t=20, b=20))
             st.plotly_chart(fig3, use_container_width=True)
-        else:
-            st.info("No closed trades to analyze by strategy.")
-
-    # Win/Loss summary
-    if metrics["winning_trades"] > 0 or metrics["losing_trades"] > 0:
-        st.subheader("Win/Loss Summary")
-        col_w, col_l = st.columns(2)
-        with col_w:
-            st.metric("Winning Trades", metrics["winning_trades"], delta=f"Avg win: ${metrics['avg_win']:.2f}")
-        with col_l:
-            st.metric("Losing Trades", metrics["losing_trades"], delta=f"Avg loss: ${metrics['avg_loss']:.2f}")
 
 
-# ─── Page: Strategies ───────────────────────────────────────────────────────────
 def render_strategies():
     st.title("⚙️ Strategy Status")
 
     config = load_strategy_config(CONFIG_PATH)
     if not config:
-        st.warning(f"Could not load config from `{CONFIG_PATH}`. Ensure strategy.yaml exists or set CONFIG_PATH env var.")
+        st.warning(f"Could not load config from `{CONFIG_PATH}`.")
         return
 
     st.subheader("Active Strategies")
@@ -734,134 +694,101 @@ def render_strategies():
     if not df.empty:
         st.dataframe(df, use_container_width=True, hide_index=True)
     else:
-        st.info("No strategies found in config.")
+        st.info("No strategies found.")
 
     st.markdown("---")
-
-    # Detailed strategy parameters
     st.subheader("Strategy Parameters")
+
     for name, section in config.items():
         if name == "account" or not isinstance(section, dict):
             continue
         with st.expander(f"⚙️ {name}", expanded=False):
-            if isinstance(section, dict):
-                # Flatten for display
-                rows = []
-                for k, v in section.items():
-                    if isinstance(v, (dict, list)):
-                        v = json.dumps(v)
-                    rows.append({"parameter": k, "value": v})
-                st.table(pd.DataFrame(rows))
+            rows = []
+            for k, v in section.items():
+                if isinstance(v, (dict, list)):
+                    v = json.dumps(v)
+                rows.append({"parameter": k, "value": v})
+            st.table(pd.DataFrame(rows))
 
 
-# ─── Page: Trade Log ─────────────────────────────────────────────────────────────
 def render_trade_log():
     st.title("📋 Trade Log")
 
     trades_df = load_trades_log(TRADES_LOG)
     st.caption(f"Loaded {len(trades_df)} entries | Source: `{TRADES_LOG}`")
 
-    if not trades_df.empty:
-        col_f1, col_f2, col_f3 = st.columns(3)
-        with col_f1:
-            action_filter = st.multiselect(
-                "Action",
-                options=["open", "close", "error"],
-                default=["open", "close", "error"],
-            )
-        with col_f2:
-            strat_filter = st.multiselect(
-                "Strategy",
-                options=sorted(trades_df["strategy"].dropna().unique().tolist()),
-                default=[],
-            )
-        with col_f3:
-            date_range = st.date_input(
-                "Date range",
-                value=(datetime.now() - timedelta(days=30), datetime.now()),
-            )
-
-        df = trades_df.copy()
-        if action_filter:
-            df = df[df["action"].isin(action_filter)]
-        if strat_filter:
-            df = df[df["strategy"].isin(strat_filter)]
-        if len(date_range) == 2:
-            start, end = date_range
-            df = df[
-                (df["timestamp"].dt.date >= start)
-                & (df["timestamp"].dt.date <= end)
-            ]
-
-        st.dataframe(
-            df.sort_values("timestamp", ascending=False),
-            use_container_width=True,
-            hide_index=True,
-        )
-        st.download_button(
-            "Download Full Log (CSV)",
-            df.to_csv(index=False),
-            "trades_export.csv",
-            "text/csv",
-        )
-    else:
+    if trades_df.empty:
         st.info(f"No trades logged yet at `{TRADES_LOG}`.")
+        return
+
+    df = trades_df.copy()
+
+    cols = st.columns(3)
+
+    with cols[0]:
+        if "action" in df.columns:
+            action_options = sorted(df["action"].dropna().astype(str).unique().tolist())
+            action_filter = st.multiselect("Action", options=action_options, default=action_options)
+        else:
+            action_filter = []
+
+    with cols[1]:
+        if "strategy" in df.columns:
+            strat_options = sorted(df["strategy"].dropna().astype(str).unique().tolist())
+            strat_filter = st.multiselect("Strategy", options=strat_options, default=[])
+        else:
+            strat_filter = []
+
+    with cols[2]:
+        if "timestamp" in df.columns:
+            start_default = (datetime.now() - timedelta(days=30)).date()
+            end_default = datetime.now().date()
+            date_range = st.date_input("Date range", value=(start_default, end_default))
+        else:
+            date_range = ()
+
+    if action_filter and "action" in df.columns:
+        df = df[df["action"].astype(str).isin(action_filter)]
+    if strat_filter and "strategy" in df.columns:
+        df = df[df["strategy"].astype(str).isin(strat_filter)]
+    if len(date_range) == 2 and "timestamp" in df.columns:
+        start, end = date_range
+        df = df[(df["timestamp"].dt.date >= start) & (df["timestamp"].dt.date <= end)]
+
+    if "timestamp" in df.columns:
+        df = df.sort_values("timestamp", ascending=False)
+
+    st.dataframe(df, use_container_width=True, hide_index=True)
+    st.download_button("Download CSV", df.to_csv(index=False), "trades_export.csv", "text/csv")
 
 
-# ─── Page: Settings ──────────────────────────────────────────────────────────────
 def render_settings():
     st.title("🔧 Settings & Controls")
 
     st.subheader("API Configuration")
     client = get_trading_client()
     if client:
-        st.success("✅ Connected to Alpaca")
-        try:
-            account = client.get_account()
-            st.write(f"**Account ID:** `{account.id}`")
-            st.write(f"**Status:** `{account.status}`")
-            st.write(f"**Initial Equity:** {format_currency(account.initial_equity)}")
-            st.write(f"**Currency:** `{account.currency}`")
-        except Exception as e:
-            st.error(f"Account details error: {e}")
+        account = fetch_account(client)
+        st.success("Connected to Alpaca")
+        if account:
+            st.write(f"**Account ID:** `{account.get('id', '—')}`")
+            st.write(f"**Status:** `{account.get('status', '—')}`")
+            st.write(f"**Initial/Last Equity:** {format_currency(account.get('initial_equity') or account.get('last_equity'))}")
+            st.write(f"**Currency:** `{account.get('currency', '—')}`")
     else:
-        st.error("❌ Not connected. Ensure `APCA_API_KEY_ID` and `APCA_API_SECRET_KEY` are set via Streamlit secrets or environment variables.")
+        st.warning("Not connected. Add `APCA_API_KEY_ID` and `APCA_API_SECRET_KEY`.")
 
     st.markdown("---")
     st.subheader("Trader Status")
     status = load_status_json(STATUS_FILE)
     if status:
-        col_s1, col_s2 = st.columns(2)
-        with col_s1:
-            st.write(f"**Last Run:** `{status.get('last_run', '—')}`")
-            st.write(f"**Status:** `{status.get('status', '—')}`")
-        with col_s2:
-            dur = status.get("duration_sec")
-            st.write(f"**Duration:** `{dur:.2f}s`" if dur else "**Duration:** —")
+        col1, col2 = st.columns(2)
+        col1.write(f"**Last Run:** `{status.get('last_run', '—')}`")
+        col1.write(f"**Status:** `{status.get('status', '—')}`")
+        dur = status.get("duration_sec")
+        col2.write(f"**Duration:** `{dur:.2f}s`" if isinstance(dur, (int, float)) else "**Duration:** —")
     else:
-        st.info(f"No status file at `{STATUS_FILE}`. Run the trader to see status here.")
-
-    st.markdown("---")
-    st.subheader("Strategy Controls")
-    st.warning("⚠️ Changing strategy settings here updates the live config file. Be careful!")
-    config = load_strategy_config(CONFIG_PATH)
-    if config:
-        for name, section in config.items():
-            if name == "account" or not isinstance(section, dict):
-                continue
-            enabled = section.get("enabled", False)
-            new_state = st.checkbox(f"Enable {name}", value=enabled, key=f"toggle_{name}")
-            if new_state != enabled:
-                section["enabled"] = new_state
-                try:
-                    import yaml
-                    with open(CONFIG_PATH, "w") as f:
-                        yaml.safe_dump(config, f, sort_keys=False)
-                    st.success(f"{name} {'enabled' if new_state else 'disabled'}")
-                except Exception as e:
-                    st.error(f"Failed to update config: {e}")
-    else:
-        st.warning("Config file not accessible.")
+        st.info(f"No status file at `{STATUS_FILE}`.")
 
     st.markdown("---")
     st.subheader("Environment Info")
@@ -869,32 +796,26 @@ def render_settings():
     st.write(f"**Trades log:** `{TRADES_LOG}`")
     st.write(f"**Status file:** `{STATUS_FILE}`")
     st.write(f"**Paper mode:** `{PAPER_MODE}`")
+    st.write(f"**Project secrets path:** `{PROJECT_SECRETS}`")
+    st.write(f"**Global secrets path:** `{GLOBAL_SECRETS}`")
+    st.write(f"**Secrets file detected:** `{'Yes' if has_any_secrets_file() else 'No'}`")
 
 
-# ─── Main ───────────────────────────────────────────────────────────────────────
 def main():
-    render_sidebar()
+    page = render_sidebar()
 
-    # Guard: require API keys
-    if not API_KEY or not API_SECRET:
-        st.error("API credentials not configured. Set `APCA_API_KEY_ID` and `APCA_API_SECRET_KEY` in Streamlit secrets or environment.")
-        st.stop()
-
-    client = get_trading_client()
-    if not client:
-        st.error("Could not connect to Alpaca. Check your API keys and try again.")
-        st.stop()
-
-    # Navigation
-    page = st.navigation([
-        st.Page(render_overview, title="Overview", icon="🏠"),
-        st.Page(render_positions, title="Positions", icon="💼"),
-        st.Page(render_performance, title="Performance", icon="📊"),
-        st.Page(render_strategies, title="Strategies", icon="⚙️"),
-        st.Page(render_trade_log, title="Trade Log", icon="📋"),
-        st.Page(render_settings, title="Settings", icon="🔧"),
-    ])
-    page.run()
+    if page == "Overview":
+        render_overview()
+    elif page == "Positions":
+        render_positions()
+    elif page == "Performance":
+        render_performance()
+    elif page == "Strategies":
+        render_strategies()
+    elif page == "Trade Log":
+        render_trade_log()
+    elif page == "Settings":
+        render_settings()
 
 
 if __name__ == "__main__":

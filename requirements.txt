@@ -1,11 +1,12 @@
 # Alcapa Trading Dashboard — Dependencies
 # Streamlit Cloud-ready
 
-streamlit==1.38.0
-alpaca-py==0.15.0
-pandas==2.2.3
-plotly==5.18.0
-pyyaml==6.0.2
-python-dotenv==1.0.1
-requests==2.32.3
-pillow==10.4.0  # prebuilt wheel for Python 3.10
+streamlit>=1.36
+alpaca-py>=0.27
+pandas>=2.0
+plotly>=5.20
+requests>=2.31
+yfinance>=0.2.40
+scipy>=1.12
+pyyaml>=6.0
+toml>=0.10

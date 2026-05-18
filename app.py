@@ -1,11 +1,20 @@
 """
 Alcapa Trading Dashboard — Streamlit Application
 Local-debug friendly version for WSL2 / Streamlit.
+
+Integrated additions:
+- Scheduler DB page backed by SQLite
+- Wheel signal viewer
+- Swing signal viewer
+- Scheduler orders / fills / positions viewer
+- Small scheduler P&L chart
+- Earnings-blocked panel
 """
 
 import json
 import logging
 import os
+import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Optional
@@ -32,6 +41,7 @@ logger = logging.getLogger("dashboard")
 PROJECT_ROOT = Path(__file__).resolve().parent
 PROJECT_SECRETS = PROJECT_ROOT / ".streamlit" / "secrets.toml"
 GLOBAL_SECRETS = Path.home() / ".streamlit" / "secrets.toml"
+DB_PATH = PROJECT_ROOT / "data" / "alcapa.db"
 
 
 def has_any_secrets_file() -> bool:
@@ -146,6 +156,289 @@ def get_trading_client():
         return None
 
 
+@st.cache_data(ttl=10)
+def run_db_query(query: str) -> pd.DataFrame:
+    if not DB_PATH.exists():
+        return pd.DataFrame()
+
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        df = pd.read_sql_query(query, conn)
+    except Exception as e:
+        logger.warning(f"SQLite query error: {e}")
+        df = pd.DataFrame()
+    finally:
+        conn.close()
+
+    return df
+
+
+def db_exists() -> bool:
+    return DB_PATH.exists()
+
+
+def load_db_summary():
+    query = """
+    select 'signals' as table_name, count(*) as row_count from signals
+    union all
+    select 'orders' as table_name, count(*) as row_count from orders
+    union all
+    select 'fills' as table_name, count(*) as row_count from fills
+    union all
+    select 'positions' as table_name, count(*) as row_count from positions
+    union all
+    select 'options_positions' as table_name, count(*) as row_count from options_positions
+    """
+    return run_db_query(query)
+
+
+def load_db_wheel_signals(limit: int = 20):
+    query = f"""
+    select
+      id,
+      ts,
+      symbol,
+      signal_type,
+      round(price, 2) as premium,
+      qty,
+      acted,
+      json_extract(meta, '$.contract_symbol') as contract_symbol,
+      json_extract(meta, '$.strike') as strike,
+      json_extract(meta, '$.expiry') as expiry,
+      json_extract(meta, '$.dte') as dte,
+      json_extract(meta, '$.delta') as delta,
+      json_extract(meta, '$.sigma') as sigma,
+      json_extract(meta, '$.bid_is_real') as bid_is_real,
+      json_extract(meta, '$.mode') as mode
+    from signals
+    where strategy = 'options_strategy'
+    order by id desc
+    limit {int(limit)}
+    """
+    df = run_db_query(query)
+    if not df.empty and "ts" in df.columns:
+        df["ts"] = to_sgt(df["ts"])
+    return df
+
+
+def load_db_swing_signals(limit: int = 20):
+    query = f"""
+    select
+      id,
+      ts,
+      symbol,
+      signal_type,
+      round(price, 2) as price,
+      round(atr, 2) as atr,
+      round(stop_loss, 2) as stop_loss,
+      qty,
+      acted,
+      json_extract(meta, '$.sma50') as sma50,
+      json_extract(meta, '$.sma200') as sma200,
+      json_extract(meta, '$.ema20') as ema20,
+      json_extract(meta, '$.high20') as high20
+    from signals
+    where strategy = 'swing_strategy'
+    order by id desc
+    limit {int(limit)}
+    """
+    df = run_db_query(query)
+    if not df.empty and "ts" in df.columns:
+        df["ts"] = to_sgt(df["ts"])
+    return df
+
+
+def load_db_orders(limit: int = 50):
+    query = f"""
+    select
+      id,
+      ts,
+      strategy,
+      symbol,
+      alpaca_order_id,
+      side,
+      qty,
+      order_type,
+      limit_price,
+      status
+    from orders
+    order by id desc
+    limit {int(limit)}
+    """
+    df = run_db_query(query)
+    if not df.empty and "ts" in df.columns:
+        df["ts"] = to_sgt(df["ts"])
+    return df
+
+
+def load_db_fills(limit: int = 50):
+    query = f"""
+    select
+      id,
+      ts,
+      strategy,
+      symbol,
+      alpaca_order_id,
+      filled_qty,
+      filled_price,
+      side
+    from fills
+    order by id desc
+    limit {int(limit)}
+    """
+    df = run_db_query(query)
+    if not df.empty and "ts" in df.columns:
+        df["ts"] = to_sgt(df["ts"])
+    return df
+
+
+def load_db_stock_positions():
+    query = """
+    select
+      id,
+      ts_open,
+      ts_close,
+      strategy,
+      symbol,
+      qty,
+      entry_price,
+      exit_price,
+      stop_loss,
+      pnl,
+      status
+    from positions
+    order by id desc
+    """
+    df = run_db_query(query)
+    if not df.empty:
+        if "ts_open" in df.columns:
+            df["ts_open"] = to_sgt(df["ts_open"])
+        if "ts_close" in df.columns:
+            df["ts_close"] = to_sgt(df["ts_close"])
+    return df
+
+
+def load_db_option_positions():
+    query = """
+    select
+      id,
+      ts_open,
+      ts_close,
+      symbol,
+      underlying,
+      contract_type,
+      strike,
+      expiry,
+      qty,
+      premium,
+      close_premium,
+      pnl,
+      status,
+      assignment
+    from options_positions
+    order by id desc
+    """
+    df = run_db_query(query)
+    if not df.empty:
+        if "ts_open" in df.columns:
+            df["ts_open"] = to_sgt(df["ts_open"])
+        if "ts_close" in df.columns:
+            df["ts_close"] = to_sgt(df["ts_close"])
+    return df
+
+
+def load_scheduler_pnl_summary():
+    query = """
+    select
+      symbol,
+      strategy,
+      qty,
+      entry_price,
+      exit_price,
+      pnl,
+      status
+    from positions
+    where pnl is not null
+
+    union all
+
+    select
+      underlying as symbol,
+      'options_strategy' as strategy,
+      qty,
+      premium as entry_price,
+      close_premium as exit_price,
+      pnl,
+      status
+    from options_positions
+    where pnl is not null
+    """
+    df = run_db_query(query)
+    if not df.empty:
+        if "pnl" in df.columns:
+            df["pnl"] = pd.to_numeric(df["pnl"], errors="coerce").fillna(0.0)
+        if "qty" in df.columns:
+            df["qty"] = pd.to_numeric(df["qty"], errors="coerce")
+    return df
+
+
+def load_earnings_blocked_signals(limit: int = 50):
+    query = f"""
+    select
+      id,
+      ts,
+      strategy,
+      symbol,
+      signal_type,
+      json_extract(meta, '$.reason') as reason,
+      json_extract(meta, '$.guard_days') as guard_days,
+      json_extract(meta, '$.side') as side
+    from signals
+    where signal_type = 'earnings_blocked'
+    order by id desc
+    limit {int(limit)}
+    """
+    df = run_db_query(query)
+    if not df.empty and "ts" in df.columns:
+        df["ts"] = to_sgt(df["ts"])
+    return df
+
+
+def load_recent_options_candidates(limit: int = 50):
+    query = f"""
+    select
+      id,
+      ts,
+      symbol,
+      signal_type,
+      round(price, 2) as premium,
+      json_extract(meta, '$.contract_symbol') as contract_symbol,
+      json_extract(meta, '$.strike') as strike,
+      json_extract(meta, '$.expiry') as expiry,
+      json_extract(meta, '$.dte') as dte,
+      json_extract(meta, '$.delta') as delta,
+      json_extract(meta, '$.mode') as mode,
+      acted
+    from signals
+    where strategy = 'options_strategy'
+    order by id desc
+    limit {int(limit)}
+    """
+    df = run_db_query(query)
+    if not df.empty and "ts" in df.columns:
+        df["ts"] = to_sgt(df["ts"])
+    return df
+
+
+def metric_value(df: pd.DataFrame, table_name: str) -> int:
+    if df.empty:
+        return 0
+    row = df[df["table_name"] == table_name]
+    if row.empty:
+        return 0
+    return int(row["row_count"].iloc[0])
+
+
 def fetch_account(client: TradingClient) -> Optional[Dict]:
     if not client:
         return None
@@ -160,6 +453,9 @@ def fetch_account(client: TradingClient) -> Optional[Dict]:
             "currency": getattr(account, "currency", None),
             "status": getattr(account, "status", None),
             "id": getattr(account, "id", None),
+            "options_buying_power": getattr(account, "options_buying_power", None),
+            "options_approved_level": getattr(account, "options_approved_level", None),
+            "options_trading_level": getattr(account, "options_trading_level", None),
         }
     except Exception as e:
         logger.warning(f"get_account error: {e}")
@@ -434,12 +730,13 @@ def render_sidebar():
 
         if st.button("🔄 Refresh now"):
             st.cache_resource.clear()
+            st.cache_data.clear()
             st.rerun()
 
         st.markdown("---")
         page = st.radio(
             "Navigate",
-            ["Overview", "Positions", "Performance", "Strategies", "Trade Log", "Settings"],
+            ["Overview", "Positions", "Performance", "Strategies", "Trade Log", "Scheduler DB", "Settings"],
         )
 
         st.markdown("---")
@@ -447,6 +744,8 @@ def render_sidebar():
         st.write(f"**Paper mode:** `{PAPER_MODE}`")
         st.write(f"**Project secrets:** `{PROJECT_SECRETS}`")
         st.write(f"**Secrets file found:** `{'Yes' if has_any_secrets_file() else 'No'}`")
+        st.write(f"**SQLite DB:** `{DB_PATH}`")
+        st.write(f"**DB exists:** `{'Yes' if db_exists() else 'No'}`")
 
         st.markdown("---")
         st.subheader("Account")
@@ -457,6 +756,7 @@ def render_sidebar():
                 st.metric("Equity", format_currency(account.get("equity")))
                 st.metric("Cash", format_currency(account.get("cash")))
                 st.metric("Buying Power", format_currency(account.get("buying_power")))
+                st.metric("Options BP", format_currency(account.get("options_buying_power")))
             else:
                 st.warning("Connected, but account data could not be fetched.")
         else:
@@ -492,7 +792,7 @@ def render_overview():
     account = fetch_account(client)
     positions = fetch_positions(client)
 
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
     if account:
         initial = safe_float(account.get("initial_equity") or account.get("last_equity"), 100000.0)
         equity = safe_float(account.get("equity"), initial)
@@ -505,6 +805,8 @@ def render_overview():
         with col3:
             st.metric("Buying Power", format_currency(account.get("buying_power")))
         with col4:
+            st.metric("Options BP", format_currency(account.get("options_buying_power")))
+        with col5:
             if not positions.empty and "market_value" in positions.columns:
                 total_mv = pd.to_numeric(positions["market_value"], errors="coerce").fillna(0).sum()
                 st.metric("Positions Value", format_currency(total_mv))
@@ -557,6 +859,20 @@ def render_overview():
         st.dataframe(orders_today, use_container_width=True, hide_index=True)
     else:
         st.info("No orders today.")
+
+    st.markdown("---")
+
+    if db_exists():
+        wheel_df = load_db_wheel_signals(5)
+        if not wheel_df.empty:
+            st.subheader("Latest Wheel Signals")
+            preview_cols = [
+                c for c in [
+                    "ts", "symbol", "contract_symbol", "strike", "expiry",
+                    "dte", "delta", "premium", "mode", "acted"
+                ] if c in wheel_df.columns
+            ]
+            st.dataframe(wheel_df[preview_cols], use_container_width=True, hide_index=True)
 
 
 def render_positions():
@@ -762,6 +1078,186 @@ def render_trade_log():
     st.download_button("Download CSV", df.to_csv(index=False), "trades_export.csv", "text/csv")
 
 
+def render_scheduler_db():
+    st.title("🗄️ Scheduler DB")
+
+    if not db_exists():
+        st.warning(f"Database not found at `{DB_PATH}`. Run the scheduler first.")
+        return
+
+    summary_df = load_db_summary()
+
+    top1, top2, top3 = st.columns([3, 2, 2])
+    with top1:
+        st.caption(f"SQLite database: `{DB_PATH}`")
+    with top2:
+        st.metric("Signals", metric_value(summary_df, "signals"))
+    with top3:
+        st.metric("Orders", metric_value(summary_df, "orders"))
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Fills", metric_value(summary_df, "fills"))
+    m2.metric("Stock positions", metric_value(summary_df, "positions"))
+    m3.metric("Option positions", metric_value(summary_df, "options_positions"))
+
+    st.markdown("---")
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        row_limit = st.slider("Rows per table", min_value=5, max_value=100, value=20, step=5)
+    with c2:
+        show_only_signal_only = st.checkbox("Wheel: signal_only only", value=False)
+    with c3:
+        show_only_unacted = st.checkbox("Signals: acted = 0 only", value=False)
+
+    wheel_df = load_db_wheel_signals(row_limit)
+    swing_df = load_db_swing_signals(row_limit)
+    orders_df = load_db_orders(row_limit)
+    fills_df = load_db_fills(row_limit)
+    stock_positions_df = load_db_stock_positions()
+    option_positions_df = load_db_option_positions()
+
+    if show_only_signal_only and not wheel_df.empty and "mode" in wheel_df.columns:
+        wheel_df = wheel_df[wheel_df["mode"] == "signal_only"]
+
+    if show_only_unacted:
+        if not wheel_df.empty and "acted" in wheel_df.columns:
+            wheel_df = wheel_df[wheel_df["acted"] == 0]
+        if not swing_df.empty and "acted" in swing_df.columns:
+            swing_df = swing_df[swing_df["acted"] == 0]
+
+    st.markdown("---")
+    st.subheader("Scheduler P&L")
+
+    pnl_df = load_scheduler_pnl_summary()
+    if pnl_df.empty:
+        st.info("No closed scheduler positions with P&L yet.")
+    else:
+        pnl_grouped = (
+            pnl_df.groupby("symbol", as_index=False)["pnl"]
+            .sum()
+            .sort_values("pnl", ascending=False)
+        )
+
+        fig = go.Figure()
+        fig.add_trace(
+            go.Bar(
+                x=pnl_grouped["symbol"],
+                y=pnl_grouped["pnl"],
+                marker_color=["#22c55e" if v >= 0 else "#ef4444" for v in pnl_grouped["pnl"]],
+                text=[f"${v:,.2f}" for v in pnl_grouped["pnl"]],
+                textposition="outside",
+            )
+        )
+        fig.update_layout(
+            height=280,
+            margin=dict(l=20, r=20, t=20, b=20),
+            xaxis_title="Symbol",
+            yaxis_title="P&L (USD)",
+            showlegend=False,
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("---")
+    st.subheader("Earnings-blocked panel")
+
+    earnings_df = load_earnings_blocked_signals(limit=20)
+    if earnings_df.empty:
+        st.caption("No earnings-blocked rows are currently stored in SQLite.")
+        st.info("Current scheduler logs earnings skips, but will only appear here after those skips are persisted as signal rows.")
+    else:
+        st.dataframe(earnings_df, use_container_width=True, hide_index=True)
+
+    st.subheader("Recent options candidates")
+    recent_candidates_df = load_recent_options_candidates(limit=row_limit)
+    if recent_candidates_df.empty:
+        st.info("No recent options candidates found.")
+    else:
+        st.dataframe(recent_candidates_df, use_container_width=True, hide_index=True)
+
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "Wheel signals",
+        "Swing signals",
+        "Orders",
+        "Positions",
+        "Fills",
+    ])
+
+    with tab1:
+        st.subheader("Wheel signals")
+        if wheel_df.empty:
+            st.info("No wheel signals found.")
+        else:
+            st.dataframe(wheel_df, use_container_width=True, hide_index=True)
+            st.download_button(
+                "Download wheel signals CSV",
+                wheel_df.to_csv(index=False),
+                "wheel_signals.csv",
+                "text/csv",
+                key="wheel_signals_csv",
+            )
+
+    with tab2:
+        st.subheader("Swing signals")
+        if swing_df.empty:
+            st.info("No swing signals found.")
+        else:
+            st.dataframe(swing_df, use_container_width=True, hide_index=True)
+            st.download_button(
+                "Download swing signals CSV",
+                swing_df.to_csv(index=False),
+                "swing_signals.csv",
+                "text/csv",
+                key="swing_signals_csv",
+            )
+
+    with tab3:
+        st.subheader("Scheduler orders")
+        if orders_df.empty:
+            st.info("No scheduler orders found.")
+        else:
+            st.dataframe(orders_df, use_container_width=True, hide_index=True)
+
+    with tab4:
+        st.subheader("Scheduler positions")
+        left, right = st.columns(2)
+
+        with left:
+            st.markdown("#### Stock positions")
+            if stock_positions_df.empty:
+                st.info("No stock positions found.")
+            else:
+                st.dataframe(stock_positions_df, use_container_width=True, hide_index=True)
+
+        with right:
+            st.markdown("#### Option positions")
+            if option_positions_df.empty:
+                st.info("No option positions found.")
+            else:
+                st.dataframe(option_positions_df, use_container_width=True, hide_index=True)
+
+    with tab5:
+        st.subheader("Scheduler fills")
+        if fills_df.empty:
+            st.info("No fills found.")
+        else:
+            st.dataframe(fills_df, use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+
+    st.subheader("Latest wheel candidate details")
+    if wheel_df.empty:
+        st.info("No wheel candidate metadata available.")
+    else:
+        preview_cols = [
+            c for c in [
+                "ts", "symbol", "contract_symbol", "strike", "expiry",
+                "dte", "delta", "premium", "mode", "acted"
+            ] if c in wheel_df.columns
+        ]
+        st.dataframe(wheel_df[preview_cols], use_container_width=True, hide_index=True)
+
+
 def render_settings():
     st.title("🔧 Settings & Controls")
 
@@ -775,6 +1271,9 @@ def render_settings():
             st.write(f"**Status:** `{account.get('status', '—')}`")
             st.write(f"**Initial/Last Equity:** {format_currency(account.get('initial_equity') or account.get('last_equity'))}")
             st.write(f"**Currency:** `{account.get('currency', '—')}`")
+            st.write(f"**Options Approved Level:** `{account.get('options_approved_level', '—')}`")
+            st.write(f"**Options Trading Level:** `{account.get('options_trading_level', '—')}`")
+            st.write(f"**Options Buying Power:** {format_currency(account.get('options_buying_power'))}")
     else:
         st.warning("Not connected. Add `APCA_API_KEY_ID` and `APCA_API_SECRET_KEY`.")
 
@@ -799,6 +1298,8 @@ def render_settings():
     st.write(f"**Project secrets path:** `{PROJECT_SECRETS}`")
     st.write(f"**Global secrets path:** `{GLOBAL_SECRETS}`")
     st.write(f"**Secrets file detected:** `{'Yes' if has_any_secrets_file() else 'No'}`")
+    st.write(f"**SQLite DB path:** `{DB_PATH}`")
+    st.write(f"**SQLite DB exists:** `{'Yes' if db_exists() else 'No'}`")
 
 
 def main():
@@ -814,6 +1315,8 @@ def main():
         render_strategies()
     elif page == "Trade Log":
         render_trade_log()
+    elif page == "Scheduler DB":
+        render_scheduler_db()
     elif page == "Settings":
         render_settings()
 
